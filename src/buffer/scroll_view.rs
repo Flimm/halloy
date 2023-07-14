@@ -7,7 +7,7 @@ use iced::{Command, Length};
 
 use super::user_context;
 use crate::theme;
-use crate::widget::Element;
+use crate::widget::{notify_visibility, Element};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -19,6 +19,8 @@ pub enum Message {
         viewport: scrollable::Viewport,
     },
     UserContext(user_context::Message),
+    DividerVisible,
+    DividerNotVisible,
 }
 
 #[derive(Debug, Clone)]
@@ -89,9 +91,20 @@ pub fn view<'a>(
     let show_divider = !new.is_empty() || matches!(status, Status::Idle(Anchor::Bottom));
 
     let content = if show_divider {
-        let divider = container(horizontal_rule(1).style(theme::Rule::Unread))
+        let rule = container(horizontal_rule(1).style(theme::Rule::Unread))
             .width(Length::Fill)
             .padding(5);
+
+        let divider = notify_visibility(
+            rule,
+            20.0,
+            state.notify_visibility_when,
+            match state.notify_visibility_when {
+                notify_visibility::When::Visible => Message::DividerVisible,
+                notify_visibility::When::NotVisible => Message::DividerNotVisible,
+            },
+        );
+
         column![column(old), divider, column(new)]
     } else {
         column![column(old), column(new)]
@@ -120,6 +133,7 @@ pub struct State {
     pub scrollable: scrollable::Id,
     limit: Limit,
     status: Status,
+    notify_visibility_when: notify_visibility::When,
 }
 
 impl Default for State {
@@ -128,6 +142,7 @@ impl Default for State {
             scrollable: scrollable::Id::unique(),
             limit: Limit::bottom(),
             status: Status::default(),
+            notify_visibility_when: notify_visibility::When::Visible,
         }
     }
 }
@@ -209,6 +224,14 @@ impl State {
                     Command::none(),
                     Some(Event::UserContext(user_context::update(message))),
                 );
+            }
+            Message::DividerVisible => {
+                println!("DIVIDER VISIBLE");
+                self.notify_visibility_when = notify_visibility::When::NotVisible;
+            }
+            Message::DividerNotVisible => {
+                println!("DIVIDER NOT VISIBLE");
+                self.notify_visibility_when = notify_visibility::When::Visible;
             }
         }
 
