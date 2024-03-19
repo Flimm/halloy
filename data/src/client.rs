@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::message::server_time;
 use crate::time::Posix;
 use crate::user::{Nick, NickRef};
-use crate::{config, message, mode, Buffer, Server, User};
+use crate::{config, dcc, message, mode, Buffer, Server, User};
 
 const WHO_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const WHO_RETRY_INTERVAL: Duration = Duration::from_secs(10);
@@ -171,6 +171,10 @@ impl Client {
         log::trace!("Message received => {:?}", *message);
 
         let stop_reroute = stop_reroute(&message.command);
+
+        if let Some(command) = dcc::decode(&message) {
+            log::debug!("DCC Comamand => {command:?}");
+        }
 
         let events = self.handle(message, None).unwrap_or_default();
 
