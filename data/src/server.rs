@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use futures::channel::mpsc::Sender;
+use irc::proto;
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+
+pub type Handle = Sender<proto::Message>;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Server(String);

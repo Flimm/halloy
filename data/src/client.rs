@@ -10,6 +10,7 @@ use crate::message::server_time;
 use crate::time::Posix;
 use crate::user::{Nick, NickRef};
 use crate::{config, dcc, message, mode, Buffer, Server, User};
+use crate::{file_transfer, server};
 
 const WHO_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const WHO_RETRY_INTERVAL: Duration = Duration::from_secs(10);
@@ -65,12 +66,13 @@ pub enum Event {
     WithTarget(message::Encoded, Nick, message::Target),
     Broadcast(Broadcast),
     Notification(message::Encoded, Nick, Notification),
+    FileTransferRequest(file_transfer::ReceiveRequest),
 }
 
 pub struct Client {
     server: Server,
     config: config::Server,
-    sender: mpsc::Sender<proto::Message>,
+    handle: server::Handle,
     alt_nick: Option<usize>,
     resolved_nick: Option<String>,
     chanmap: BTreeMap<String, Channel>,
@@ -118,7 +120,7 @@ impl Client {
         Self {
             server,
             config,
-            sender,
+            handle: sender,
             resolved_nick: None,
             alt_nick: None,
             chanmap: BTreeMap::default(),
@@ -138,7 +140,7 @@ impl Client {
     pub async fn quit(mut self) {
         use tokio::time;
 
-        let _ = self.sender.try_send(command!("QUIT"));
+        let _ = self.handle.try_send(command!("QUIT"));
 
         // Ensure message is sent before dropping
         time::sleep(Duration::from_secs(1)).await;
@@ -162,7 +164,7 @@ impl Client {
 
         self.reroute_responses_to = start_reroute(&message.command).then(|| buffer.clone());
 
-        if let Err(e) = self.sender.try_send(message.into()) {
+        if let Err(e) = self.handle.try_send(message.into()) {
             log::warn!("Error sending message: {e}");
         }
     }
@@ -171,10 +173,6 @@ impl Client {
         log::trace!("Message received => {:?}", *message);
 
         let stop_reroute = stop_reroute(&message.command);
-
-        if let Some(command) = dcc::decode(&message) {
-            log::debug!("DCC Comamand => {command:?}");
-        }
 
         let events = self.handle(message, None).unwrap_or_default();
 
@@ -322,12 +320,12 @@ impl Client {
                         // Request
                         self.registration_step = RegistrationStep::Req;
                         let _ = self
-                            .sender
+                            .handle
                             .try_send(command!("CAP", "REQ", requested.join(" ")));
                     } else {
                         // If none requested, end negotiation
                         self.registration_step = RegistrationStep::End;
-                        let _ = self.sender.try_send(command!("CAP", "END"));
+                        let _ = self.handle.try_send(command!("CAP", "END"));
                     }
                 }
             }
@@ -349,11 +347,11 @@ impl Client {
                 if let Some(sasl) = self.config.sasl.as_ref().filter(|_| supports_sasl) {
                     self.registration_step = RegistrationStep::Sasl;
                     let _ = self
-                        .sender
+                        .handle
                         .try_send(command!("AUTHENTICATE", sasl.command()));
                 } else {
                     self.registration_step = RegistrationStep::End;
-                    let _ = self.sender.try_send(command!("CAP", "END"));
+                    let _ = self.handle.try_send(command!("CAP", "END"));
                 }
             }
             Command::CAP(_, sub, a, b) if sub == "NAK" => {
@@ -363,16 +361,16 @@ impl Client {
                 // End we didn't move to sasl or already ended
                 if self.registration_step < RegistrationStep::Sasl {
                     self.registration_step = RegistrationStep::End;
-                    let _ = self.sender.try_send(command!("CAP", "END"));
+                    let _ = self.handle.try_send(command!("CAP", "END"));
                 }
             }
             Command::AUTHENTICATE(param) if param == "+" => {
                 if let Some(sasl) = self.config.sasl.as_ref() {
                     log::info!("[{}] sasl auth: {}", self.server, sasl.command());
 
-                    let _ = self.sender.try_send(command!("AUTHENTICATE", sasl.param()));
+                    let _ = self.handle.try_send(command!("AUTHENTICATE", sasl.param()));
                     self.registration_step = RegistrationStep::End;
-                    let _ = self.sender.try_send(command!("CAP", "END"));
+                    let _ = self.handle.try_send(command!("CAP", "END"));
                 }
             }
             Command::Numeric(RPL_LOGGEDIN, _) => {
@@ -380,8 +378,23 @@ impl Client {
             }
             Command::PRIVMSG(channel, text) | Command::NOTICE(channel, text) => {
                 if let Some(user) = message.user() {
+                    if let Some(command) = dcc::decode(text) {
+                        match command {
+                            dcc::Command::Send(request) => {
+                                log::trace!("DCC Send => {request:?}");
+                                return Some(vec![Event::FileTransferRequest(
+                                    file_transfer::ReceiveRequest {
+                                        from: user.nickname().to_owned(),
+                                        dcc_send: request,
+                                        server: self.server.clone(),
+                                        server_handle: self.handle.clone(),
+                                    },
+                                )]);
+                            }
+                        }
+                    }
                     // Highlight notification
-                    if message::reference_user(user.nickname(), self.nickname(), text)
+                    else if message::reference_user(user.nickname(), self.nickname(), text)
                         && self.highlight_blackout.allow_highlights()
                     {
                         return Some(vec![Event::Notification(
@@ -448,7 +461,7 @@ impl Client {
                 }
 
                 if let Some(nick) = self.alt_nick.and_then(|i| self.config.alt_nicks.get(i)) {
-                    let _ = self.sender.try_send(command!("NICK", nick));
+                    let _ = self.handle.try_send(command!("NICK", nick));
                 }
             }
             Command::Numeric(RPL_WELCOME, args) => {
@@ -461,7 +474,7 @@ impl Client {
                     // Try ghost recovery if we couldn't claim our nick
                     if self.config.should_ghost && nick != &self.config.nickname {
                         for sequence in &self.config.ghost_sequence {
-                            let _ = self.sender.try_send(command!(
+                            let _ = self.handle.try_send(command!(
                                 "PRIVMSG",
                                 "NickServ",
                                 format!("{sequence} {} {nick_pass}", &self.config.nickname)
@@ -469,7 +482,7 @@ impl Client {
                         }
                     }
 
-                    let _ = self.sender.try_send(command!(
+                    let _ = self.handle.try_send(command!(
                         "PRIVMSG",
                         "NickServ",
                         format!("IDENTIFY {} {nick_pass}", &self.config.nickname)
@@ -478,21 +491,21 @@ impl Client {
 
                 // Send user modestring
                 if let Some(modestring) = self.config.umodes.as_ref() {
-                    let _ = self.sender.try_send(command!("MODE", nick, modestring));
+                    let _ = self.handle.try_send(command!("MODE", nick, modestring));
                 }
 
                 // Loop on connect commands
                 for command in self.config.on_connect.iter() {
                     if let Ok(cmd) = crate::command::parse(command, None) {
                         if let Ok(command) = proto::Command::try_from(cmd) {
-                            let _ = self.sender.try_send(command.into());
+                            let _ = self.handle.try_send(command.into());
                         };
                     };
                 }
 
                 // Send JOIN
                 for message in group_joins(&self.config) {
-                    let _ = self.sender.try_send(message);
+                    let _ = self.handle.try_send(message);
                 }
             }
             // QUIT
@@ -528,7 +541,7 @@ impl Client {
 
                     if let Some(state) = self.chanmap.get_mut(channel) {
                         // Sends WHO to get away state on users.
-                        let _ = self.sender.try_send(command!("WHO", channel));
+                        let _ = self.handle.try_send(command!("WHO", channel));
                         state.last_who = Some(WhoStatus::Requested(Instant::now()));
                         log::debug!("[{}] {channel} - WHO requested", self.server);
                     }
@@ -771,7 +784,7 @@ impl Client {
             };
 
             if let Some(request) = request {
-                let _ = self.sender.try_send(command!("WHO", channel));
+                let _ = self.handle.try_send(command!("WHO", channel));
                 state.last_who = Some(WhoStatus::Requested(Instant::now()));
                 log::debug!(
                     "[{}] {channel} - WHO {}",

@@ -17,7 +17,7 @@ use std::env;
 use std::time::{Duration, Instant};
 
 use data::config::{self, Config};
-use data::{environment, server, User};
+use data::{environment, file_transfer, server, User};
 use iced::widget::container;
 use iced::{executor, Application, Command, Length, Subscription};
 use screen::{dashboard, help, migration, welcome};
@@ -101,6 +101,7 @@ struct Halloy {
     config: Config,
     clients: data::client::Map,
     servers: server::Map,
+    file_transfers: file_transfer::Manager,
 }
 
 impl Halloy {
@@ -162,6 +163,7 @@ impl Halloy {
                 clients: Default::default(),
                 servers: config.servers.clone(),
                 config,
+                file_transfers: file_transfer::Manager::default(),
             },
             command,
         )
@@ -184,6 +186,7 @@ pub enum Message {
     Migration(migration::Message),
     Event(Event),
     Tick(Instant),
+    FileTransfer(file_transfer::task::Update),
 }
 
 impl Application for Halloy {
@@ -350,124 +353,149 @@ impl Application for Halloy {
                         return Command::none();
                     };
 
-                    messages.into_iter().for_each(|message| {
-                        for event in self.clients.receive(&server, message) {
-                            // Resolve a user using client state which stores attributes
-                            let resolve_user_attributes = |user: &User, channel: &str| {
-                                self.clients
-                                    .resolve_user_attributes(&server, channel, user)
-                                    .cloned()
-                            };
+                    let commands = messages
+                        .into_iter()
+                        .flat_map(|message| {
+                            let mut commands = vec![];
 
-                            match event {
-                                data::client::Event::Single(encoded, our_nick) => {
-                                    if let Some(message) = data::Message::received(
-                                        encoded,
-                                        our_nick,
-                                        &self.config,
-                                        resolve_user_attributes,
-                                    ) {
-                                        dashboard.record_message(&server, message);
+                            for event in self.clients.receive(&server, message) {
+                                // Resolve a user using client state which stores attributes
+                                let resolve_user_attributes = |user: &User, channel: &str| {
+                                    self.clients
+                                        .resolve_user_attributes(&server, channel, user)
+                                        .cloned()
+                                };
+
+                                match event {
+                                    data::client::Event::Single(encoded, our_nick) => {
+                                        if let Some(message) = data::Message::received(
+                                            encoded,
+                                            our_nick,
+                                            &self.config,
+                                            resolve_user_attributes,
+                                        ) {
+                                            dashboard.record_message(&server, message);
+                                        }
                                     }
-                                }
-                                data::client::Event::WithTarget(encoded, our_nick, target) => {
-                                    if let Some(message) = data::Message::received(
-                                        encoded,
-                                        our_nick,
-                                        &self.config,
-                                        resolve_user_attributes,
-                                    ) {
-                                        dashboard
-                                            .record_message(&server, message.with_target(target));
+                                    data::client::Event::WithTarget(encoded, our_nick, target) => {
+                                        if let Some(message) = data::Message::received(
+                                            encoded,
+                                            our_nick,
+                                            &self.config,
+                                            resolve_user_attributes,
+                                        ) {
+                                            dashboard.record_message(
+                                                &server,
+                                                message.with_target(target),
+                                            );
+                                        }
                                     }
-                                }
-                                data::client::Event::Broadcast(broadcast) => match broadcast {
-                                    data::client::Broadcast::Quit {
-                                        user,
-                                        comment,
-                                        channels,
-                                    } => {
-                                        dashboard.broadcast_quit(
-                                            &server,
+                                    data::client::Event::Broadcast(broadcast) => match broadcast {
+                                        data::client::Broadcast::Quit {
                                             user,
                                             comment,
                                             channels,
-                                            &self.config,
-                                        );
-                                    }
-                                    data::client::Broadcast::Nickname {
-                                        old_user,
-                                        new_nick,
-                                        ourself,
-                                        channels,
-                                    } => {
-                                        let old_nick = old_user.nickname();
-
-                                        dashboard.broadcast_nickname(
-                                            &server,
-                                            old_nick.to_owned(),
+                                        } => {
+                                            dashboard.broadcast_quit(
+                                                &server,
+                                                user,
+                                                comment,
+                                                channels,
+                                                &self.config,
+                                            );
+                                        }
+                                        data::client::Broadcast::Nickname {
+                                            old_user,
                                             new_nick,
                                             ourself,
                                             channels,
-                                            &self.config,
-                                        );
-                                    }
-                                    data::client::Broadcast::Invite {
-                                        inviter,
-                                        channel,
-                                        user_channels,
-                                    } => {
-                                        let inviter = inviter.nickname();
+                                        } => {
+                                            let old_nick = old_user.nickname();
 
-                                        dashboard.broadcast_invite(
-                                            &server,
-                                            inviter.to_owned(),
+                                            dashboard.broadcast_nickname(
+                                                &server,
+                                                old_nick.to_owned(),
+                                                new_nick,
+                                                ourself,
+                                                channels,
+                                                &self.config,
+                                            );
+                                        }
+                                        data::client::Broadcast::Invite {
+                                            inviter,
                                             channel,
                                             user_channels,
-                                            &self.config,
-                                        );
-                                    }
-                                },
-                                data::client::Event::Notification(
-                                    encoded,
-                                    our_nick,
-                                    notification,
-                                ) => {
-                                    if let Some(message) = data::Message::received(
+                                        } => {
+                                            let inviter = inviter.nickname();
+
+                                            dashboard.broadcast_invite(
+                                                &server,
+                                                inviter.to_owned(),
+                                                channel,
+                                                user_channels,
+                                                &self.config,
+                                            );
+                                        }
+                                    },
+                                    data::client::Event::Notification(
                                         encoded,
                                         our_nick,
-                                        &self.config,
-                                        resolve_user_attributes,
-                                    ) {
-                                        dashboard.record_message(&server, message);
-                                    }
+                                        notification,
+                                    ) => {
+                                        if let Some(message) = data::Message::received(
+                                            encoded,
+                                            our_nick,
+                                            &self.config,
+                                            resolve_user_attributes,
+                                        ) {
+                                            dashboard.record_message(&server, message);
+                                        }
 
-                                    match notification {
-                                        data::client::Notification::Highlight(user, channel) => {
-                                            let notification = &self.config.notifications.highlight;
-                                            if notification.enabled {
-                                                notification::show(
-                                                    "Highlight",
-                                                    format!(
-                                                        "{} highlighted you in {}",
-                                                        user.nickname(),
-                                                        channel
-                                                    ),
-                                                    notification.sound(),
-                                                );
+                                        match notification {
+                                            data::client::Notification::Highlight(
+                                                user,
+                                                channel,
+                                            ) => {
+                                                let notification =
+                                                    &self.config.notifications.highlight;
+                                                if notification.enabled {
+                                                    notification::show(
+                                                        "Highlight",
+                                                        format!(
+                                                            "{} highlighted you in {}",
+                                                            user.nickname(),
+                                                            channel
+                                                        ),
+                                                        notification.sound(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    data::client::Event::FileTransferRequest(request) => {
+                                        if let Some(event) = self.file_transfers.receive(request) {
+                                            match event {
+                                                file_transfer::manager::Event::RunTask(task) => {
+                                                    commands.push(Command::run(
+                                                        task,
+                                                        Message::FileTransfer,
+                                                    ));
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                    });
+
+                            commands
+                        })
+                        .collect::<Vec<_>>();
 
                     // Must be called after receiving message batches to ensure
                     // user & channel lists are in sync
                     self.clients.sync(&server);
 
-                    Command::none()
+                    Command::batch(commands)
                 }
             },
             Message::Event(event) => {
@@ -489,6 +517,10 @@ impl Application for Halloy {
                 } else {
                     Command::none()
                 }
+            }
+            Message::FileTransfer(update) => {
+                self.file_transfers.update(update);
+                Command::none()
             }
         }
     }
